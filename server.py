@@ -3,15 +3,35 @@ import pickle
 from functools import lru_cache
 from typing import Optional
 
+import ollama
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from reader3 import Book, BookMetadata, ChapterContent, TOCEntry
 
 app = FastAPI()
 templates = Jinja2Templates(directory="templates")
+
+# In-memory chat history keyed by (book_id, chapter_index)
+chat_histories: dict[tuple[str, int], list[dict[str, str]]] = {}
+
+CHAT_MODEL = "llama3.1:8b"
+
+SYSTEM_PROMPT_TEMPLATE = """You are a reading companion. The user is reading the following book chapter. \
+Your role is to ask thought-provoking comprehension questions, discuss themes, \
+clarify difficult passages, and help the reader engage more deeply with the text. \
+Keep responses concise and conversational.
+
+--- CHAPTER TEXT ---
+{chapter_text}
+--- END CHAPTER TEXT ---"""
+
+
+class ChatMessage(BaseModel):
+    message: str
 
 # Where are the book folders located?
 BOOKS_DIR = "."
@@ -103,6 +123,40 @@ async def serve_image(book_id: str, image_name: str):
         raise HTTPException(status_code=404, detail="Image not found")
 
     return FileResponse(img_path)
+
+@app.post("/chat/{book_id}/{chapter_index}")
+async def chat(book_id: str, chapter_index: int, msg: ChatMessage):
+    book = load_book_cached(book_id)
+    if not book:
+        raise HTTPException(status_code=404, detail="Book not found")
+    if chapter_index < 0 or chapter_index >= len(book.spine):
+        raise HTTPException(status_code=404, detail="Chapter not found")
+
+    key = (book_id, chapter_index)
+    if key not in chat_histories:
+        chat_histories[key] = []
+
+    chapter_text = book.spine[chapter_index].text
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(chapter_text=chapter_text[:8000])
+
+    chat_histories[key].append({"role": "user", "content": msg.message})
+
+    response = ollama.chat(
+        model=CHAT_MODEL,
+        messages=[{"role": "system", "content": system_prompt}] + chat_histories[key],
+    )
+    reply = response.message.content
+    chat_histories[key].append({"role": "assistant", "content": reply})
+
+    return JSONResponse({"reply": reply})
+
+
+@app.post("/chat/{book_id}/{chapter_index}/reset")
+async def chat_reset(book_id: str, chapter_index: int):
+    key = (book_id, chapter_index)
+    chat_histories.pop(key, None)
+    return JSONResponse({"status": "ok"})
+
 
 if __name__ == "__main__":
     import uvicorn
